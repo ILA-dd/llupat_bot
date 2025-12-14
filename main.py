@@ -16,6 +16,12 @@ logger = logging.getLogger('bot')
 with open('config.json', 'r') as f:
     config = json.load(f)
 
+# Set default check interval if not in config
+if 'check_interval' not in config:
+    config['check_interval'] = 15
+    with open('config.json', 'w') as f:
+        json.dump(config, f, indent=4)
+
 # Initialize Bot
 intents = discord.Intents.default()
 intents.message_content = True
@@ -40,6 +46,37 @@ def get_server_key(addr_list):
     # Use the first one as the key
     return sorted_addrs[0]
 
+def get_flag(loc):
+    """Convert location code to flag emoji with improved accuracy"""
+    if not loc:
+        return "🏳️"
+    
+    try:
+        # Handle format like "EUR:DE" or "ASI:CN" - take the part after colon
+        if ':' in loc:
+            code = loc.split(':')[-1].strip()
+        else:
+            code = loc.strip()
+        
+        # Ensure it's exactly 2 characters and uppercase
+        if len(code) != 2:
+            return "🏳️"
+        
+        code = code.upper()
+        
+        # Validate it's only letters (ISO 3166-1 alpha-2)
+        if not code.isalpha():
+            return "🏳️"
+        
+        # Convert to regional indicator symbols
+        # A = U+1F1E6, B = U+1F1E7, etc.
+        flag = chr(ord(code[0]) + 127397) + chr(ord(code[1]) + 127397)
+        return flag
+        
+    except Exception as e:
+        logger.error(f"Error converting location '{loc}' to flag: {e}")
+        return "🏳️"
+
 def is_authorized():
     async def predicate(ctx):
         if ctx.author.id not in config.get('authorized_users', []):
@@ -51,6 +88,7 @@ def is_authorized():
 @bot.event
 async def on_ready():
     logger.info(f'Logged in as {bot.user} (ID: {bot.user.id})')
+    check_players_loop.change_interval(seconds=config.get('check_interval', 15))
     check_players_loop.start()
 
 @tasks.loop(seconds=15)
@@ -169,21 +207,6 @@ async def send_grouped_notification(channel, players, server_addr):
         clean_addr = ip_match.group(1)
     else:
         clean_addr = raw_addr
-
-    def get_flag(loc):
-        if not loc: return "🏳️"
-        try:
-            if ':' in loc:
-                code = loc.split(':')[-1]
-            else:
-                code = loc
-            
-            if len(code) == 2:
-                code = code.upper()
-                return chr(ord(code[0]) + 127397) + chr(ord(code[1]) + 127397)
-            return "🏳️"
-        except:
-            return "🏳️"
 
     flag = get_flag(country)
     
@@ -313,6 +336,7 @@ async def track(ctx, action: str = None, *, player_name: str = None):
     !track add <player_name>
     !track remove <player_name>
     !track list
+    !track interval <seconds>
     """
     if action == "add" and player_name:
         if player_name.lower() not in [p.lower() for p in config['tracked_players']]:
@@ -346,9 +370,149 @@ async def track(ctx, action: str = None, *, player_name: str = None):
         else:
             msg = "No players are being tracked."
         await ctx.send(msg)
+    
+    elif action == "interval":
+        if player_name:
+            try:
+                # player_name contains the seconds value in this case
+                seconds = int(player_name)
+                if seconds < 5:
+                    await ctx.send("⚠️ Минимальный интервал: 5 секунд.")
+                    return
+                if seconds > 300:
+                    await ctx.send("⚠️ Максимальный интервал: 300 секунд (5 минут).")
+                    return
+                
+                # Save to config
+                config['check_interval'] = seconds
+                save_config()
+                
+                # Restart loop with new interval
+                check_players_loop.change_interval(seconds=seconds)
+                if check_players_loop.is_running():
+                    check_players_loop.restart()
+                else:
+                    check_players_loop.start()
+                
+                await ctx.send(f"✅ Интервал проверки установлен на **{seconds}** секунд.")
+            except ValueError:
+                await ctx.send("❌ Укажите корректное число секунд.")
+        else:
+            await ctx.send("Использование: `!track interval <секунды>`")
         
     else:
-        await ctx.send("Использование: `!track add <player>`, `!track remove <player>`, `!track list`")
+        await ctx.send("Использование: `!track add <player>`, `!track remove <player>`, `!track list`, `!track interval <секунды>`")
+
+@bot.command()
+async def tracker_status(ctx):
+    """Shows current tracker status and online players."""
+    # Determine overall status
+    loop_running = check_players_loop.is_running()
+    api_working = False
+    overall_status = "🔴 Not Working"
+    status_color = discord.Color.red()
+    
+    # Test API connection
+    try:
+        test_data = await api.fetch_servers()
+        if test_data and 'servers' in test_data:
+            api_working = True
+    except:
+        api_working = False
+    
+    # Determine overall status
+    if loop_running and api_working:
+        overall_status = "🟢 Working"
+        status_color = discord.Color.green()
+    elif loop_running and not api_working:
+        overall_status = "🟡 Partial (API Error)"
+        status_color = discord.Color.orange()
+    elif not loop_running:
+        overall_status = "🔴 Not Working (Loop Stopped)"
+        status_color = discord.Color.red()
+    
+    embed = discord.Embed(
+        title="📊 Tracker Status",
+        description=f"**Status:** {overall_status}",
+        color=status_color,
+        timestamp=discord.utils.utcnow()
+    )
+    
+    # Loop status
+    loop_status = "🟢 Running" if loop_running else "🔴 Stopped"
+    embed.add_field(name="Tracking Loop", value=loop_status, inline=True)
+    
+    # API status
+    api_status = "🟢 Connected" if api_working else "🔴 Connection Failed"
+    embed.add_field(name="DDNet API", value=api_status, inline=True)
+    
+    # Tracked players count
+    tracked_count = len(config.get('tracked_players', []))
+    embed.add_field(name="Tracked Players", value=str(tracked_count), inline=True)
+    
+    # Notification channel
+    channel_id = config.get('notification_channel_id')
+    if channel_id:
+        channel = bot.get_channel(channel_id)
+        channel_mention = channel.mention if channel else f"⚠️ Channel not found (ID: {channel_id})"
+    else:
+        channel_mention = "⚠️ Not set"
+    embed.add_field(name="Notification Channel", value=channel_mention, inline=False)
+    
+    # Check online players
+    if api_working:
+        try:
+            servers_data = await api.fetch_servers()
+            if servers_data:
+                online_players = []
+                for player_name in tracker.tracked_players:
+                    instances = api.find_player(servers_data, player_name)
+                    if instances:
+                        server_info = instances[0]['server']
+                        map_name = server_info.get('info', {}).get('map', {}).get('name', 'Unknown')
+                        online_players.append(f"🟢 **{player_name}** - {map_name}")
+                
+                if online_players:
+                    embed.add_field(
+                        name=f"Online Now ({len(online_players)})",
+                        value="\n".join(online_players),
+                        inline=False
+                    )
+                else:
+                    embed.add_field(
+                        name="Online Now",
+                        value="No tracked players online",
+                        inline=False
+                    )
+        except Exception as e:
+            logger.error(f"Error checking online players: {e}")
+            embed.add_field(
+                name="Online Status",
+                value="⚠️ Error checking online status",
+                inline=False
+            )
+    else:
+        embed.add_field(
+            name="Online Status",
+            value="⚠️ Cannot check (API not available)",
+            inline=False
+        )
+    
+    # Active notifications
+    active_count = len(active_messages)
+    embed.add_field(name="Active Notifications", value=str(active_count), inline=True)
+    
+    # Admins count
+    admin_count = len(config.get('authorized_users', []))
+    embed.add_field(name="Authorized Admins", value=str(admin_count), inline=True)
+    
+    # Check interval
+    check_interval = config.get('check_interval', 15)
+    embed.add_field(name="Check Interval", value=f"{check_interval} seconds", inline=True)
+    
+    embed.set_footer(text="Создано кланом llUPAT | Разработчик: ILA")
+    
+    await ctx.send(embed=embed)
 
 @bot.command()
 @is_authorized()
@@ -450,7 +614,6 @@ async def track_admin(ctx, action: str = None, user_id: int = None):
 
 
 @bot.command()
-@is_authorized()
 async def track_help(ctx):
     """Shows help information about the bot commands."""
     embed = discord.Embed(
@@ -462,6 +625,7 @@ async def track_help(ctx):
     embed.add_field(name="✅ !track add <name>", value="Добавить игрока в трекер", inline=False)
     embed.add_field(name="❌ !track remove <name>", value="Удалить игрока из трекера", inline=False)
     embed.add_field(name="📜 !track list", value="Показать список игроков в трекере", inline=False)
+    embed.add_field(name="📊 !tracker_status", value="Показать статус трекера и онлайн игроков", inline=False)
     embed.add_field(name="📢 !setchannel", value="Установить текущий канал для уведомлений", inline=False)
     embed.add_field(name="🎉 !track_admin add <user_id>", value="Добавить пользователя в список админов", inline=False)
     
